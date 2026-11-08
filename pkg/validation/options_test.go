@@ -1,16 +1,24 @@
 package validation
 
 import (
+	"bytes"
 	"crypto"
-	"io/ioutil"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
+	middlewareapi "github.com/oauth2-proxy/oauth2-proxy/v7/pkg/apis/middleware"
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/apis/options"
+	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/ip"
+	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/logger"
+	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/util/ptr"
+	"github.com/onsi/ginkgo/v2"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 const (
@@ -22,7 +30,7 @@ const (
 
 func testOptions() *options.Options {
 	o := options.NewOptions()
-	o.UpstreamServers = append(o.UpstreamServers, options.Upstream{
+	o.UpstreamServers.Upstreams = append(o.UpstreamServers.Upstreams, options.Upstream{
 		ID:   "upstream",
 		Path: "/",
 		URI:  "http://127.0.0.1:8080/",
@@ -49,80 +57,43 @@ func TestNewOptions(t *testing.T) {
 	assert.NotEqual(t, nil, err)
 
 	expected := errorMsg([]string{
-		"missing setting: cookie-secret",
+		"missing setting: cookie-secret or cookie-secret-file",
 		"provider has empty id: ids are required for all providers",
 		"provider missing setting: client-id",
 		"missing setting: client-secret or client-secret-file"})
 	assert.Equal(t, expected, err.Error())
 }
 
-func TestClientSecretFileOptionFails(t *testing.T) {
-	o := options.NewOptions()
-	o.Cookie.Secret = cookieSecret
-	o.Providers[0].ID = providerID
-	o.Providers[0].ClientID = clientID
-	o.Providers[0].ClientSecretFile = clientSecret
-	o.EmailDomains = []string{"*"}
-	err := Validate(o)
-	assert.NotEqual(t, nil, err)
-
-	p := o.GetProvider().Data()
-	assert.Equal(t, clientSecret, p.ClientSecretFile)
-	assert.Equal(t, "", p.ClientSecret)
-
-	s, err := p.GetClientSecret()
-	assert.NotEqual(t, nil, err)
-	assert.Equal(t, "", s)
-}
-
-func TestClientSecretFileOption(t *testing.T) {
-	var err error
-	f, err := ioutil.TempFile("", "client_secret_temp_file_")
-	if err != nil {
-		t.Fatalf("failed to create temp file: %v", err)
-	}
-	_, err = f.WriteString("testcase")
-	if err != nil {
-		t.Fatalf("failed to write to temp file: %v", err)
-	}
-	if err := f.Close(); err != nil {
-		t.Fatalf("failed to close temp file: %v", err)
-	}
-	clientSecretFileName := f.Name()
-	defer func(t *testing.T) {
-		if err := os.Remove(clientSecretFileName); err != nil {
-			t.Fatalf("failed to delete temp file: %v", err)
-		}
-	}(t)
-
-	o := options.NewOptions()
-	o.Cookie.Secret = cookieSecret
-	o.Providers[0].ID = providerID
-	o.Providers[0].ClientID = clientID
-	o.Providers[0].ClientSecretFile = clientSecretFileName
-	o.EmailDomains = []string{"*"}
-	err = Validate(o)
-	assert.Equal(t, nil, err)
-
-	p := o.GetProvider().Data()
-	assert.Equal(t, clientSecretFileName, p.ClientSecretFile)
-	assert.Equal(t, "", p.ClientSecret)
-
-	s, err := p.GetClientSecret()
-	assert.Equal(t, nil, err)
-	assert.Equal(t, "testcase", s)
-}
-
-func TestGoogleGroupOptions(t *testing.T) {
+func TestGoogleGroupOptionsWithoutServiceAccountJSON(t *testing.T) {
 	o := testOptions()
-	o.Providers[0].GoogleConfig.Groups = []string{"googlegroup"}
+	o.Providers[0].GoogleConfig.AdminEmail = "admin@example.com"
 	err := Validate(o)
 	assert.NotEqual(t, nil, err)
 
 	expected := errorMsg([]string{
-		"missing setting: google-admin-email",
-		"missing setting: google-service-account-json"})
+		"missing setting: google-service-account-json or google-use-application-default-credentials"})
 	assert.Equal(t, expected, err.Error())
+}
+
+func TestGoogleGroupOptionsWithoutAdminEmail(t *testing.T) {
+	o := testOptions()
+	o.Providers[0].GoogleConfig.UseApplicationDefaultCredentials = ptr.To(true)
+	err := Validate(o)
+	assert.NotEqual(t, nil, err)
+
+	expected := errorMsg([]string{
+		"missing setting: google-admin-email"})
+	assert.Equal(t, expected, err.Error())
+}
+
+func TestGoogleGroupOptionsWithoutGroups(t *testing.T) {
+	o := testOptions()
+	// Set admin email and application default credentials but no groups - should still require them
+	o.Providers[0].GoogleConfig.AdminEmail = "admin@example.com"
+	o.Providers[0].GoogleConfig.UseApplicationDefaultCredentials = ptr.To(true)
+	err := Validate(o)
+	// Should pass validation since google-group is now optional
+	assert.Equal(t, nil, err)
 }
 
 func TestGoogleGroupInvalidFile(t *testing.T) {
@@ -134,7 +105,7 @@ func TestGoogleGroupInvalidFile(t *testing.T) {
 	assert.NotEqual(t, nil, err)
 
 	expected := errorMsg([]string{
-		"invalid Google credentials file: file_doesnt_exist.json",
+		"Google credentials file not found: file_doesnt_exist.json",
 	})
 	assert.Equal(t, expected, err.Error())
 }
@@ -153,18 +124,6 @@ func TestRedirectURL(t *testing.T) {
 	expected := &url.URL{
 		Scheme: "https", Host: "myhost.com", Path: "/oauth2/callback"}
 	assert.Equal(t, expected, o.GetRedirectURL())
-}
-
-func TestDefaultProviderApiSettings(t *testing.T) {
-	o := testOptions()
-	assert.Equal(t, nil, Validate(o))
-	p := o.GetProvider().Data()
-	assert.Equal(t, "https://accounts.google.com/o/oauth2/auth?access_type=offline",
-		p.LoginURL.String())
-	assert.Equal(t, "https://www.googleapis.com/oauth2/v3/token",
-		p.RedeemURL.String())
-	assert.Equal(t, "", p.ProfileURL.String())
-	assert.Equal(t, "profile email", p.Scope)
 }
 
 func TestCookieRefreshMustBeLessThanCookieExpire(t *testing.T) {
@@ -228,23 +187,6 @@ func TestValidateSignatureKeyUnsupportedAlgorithm(t *testing.T) {
 		"  unsupported signature hash algorithm: "+o.SignatureKey)
 }
 
-func TestSkipOIDCDiscovery(t *testing.T) {
-	o := testOptions()
-	o.Providers[0].Type = "oidc"
-	o.Providers[0].OIDCConfig.IssuerURL = "https://login.microsoftonline.com/fabrikamb2c.onmicrosoft.com/v2.0/"
-	o.Providers[0].OIDCConfig.SkipDiscovery = true
-
-	err := Validate(o)
-	assert.Equal(t, "invalid configuration:\n"+
-		"  missing setting: login-url\n  missing setting: redeem-url\n  missing setting: oidc-jwks-url", err.Error())
-
-	o.Providers[0].LoginURL = "https://login.microsoftonline.com/fabrikamb2c.onmicrosoft.com/oauth2/v2.0/authorize?p=b2c_1_sign_in"
-	o.Providers[0].RedeemURL = "https://login.microsoftonline.com/fabrikamb2c.onmicrosoft.com/oauth2/v2.0/token?p=b2c_1_sign_in"
-	o.Providers[0].OIDCConfig.JwksURL = "https://login.microsoftonline.com/fabrikamb2c.onmicrosoft.com/discovery/v2.0/keys"
-
-	assert.Equal(t, nil, Validate(o))
-}
-
 func TestGCPHealthcheck(t *testing.T) {
 	o := testOptions()
 	o.GCPHealthChecks = true
@@ -290,8 +232,67 @@ func TestRealClientIPHeader(t *testing.T) {
 	assert.Nil(t, o.GetRealClientIPParser())
 }
 
+func TestRealClientIPLogging(t *testing.T) {
+	t.Cleanup(func() {
+		logger.SetOutput(ginkgo.GinkgoWriter)
+		logger.SetAuthTemplate(logger.DefaultAuthLoggingFormat)
+		logger.SetReqTemplate(logger.DefaultRequestLoggingFormat)
+		logger.SetGetClientFunc(func(r *http.Request) string { return r.RemoteAddr })
+	})
+	tests := []struct {
+		name         string
+		remoteAddr   string
+		headerValues []string
+		reverseProxy bool
+		nilParser    bool
+		expected     string
+	}{
+		{"Untrusted peer", "198.51.100.23:1234", []string{"10.0.0.5"}, true, false, "198.51.100.23"},
+		{"Appending trusted proxy", "192.0.2.10:1234", []string{"10.0.0.5, 198.51.100.23"}, true, false, "198.51.100.23"},
+		{"Repeated fields and multiple proxies", "192.0.2.10:1234", []string{"10.0.0.5", "198.51.100.23, 192.0.2.20", "192.0.2.21"}, true, false, "198.51.100.23"},
+		{"Legitimate client", "192.0.2.10:1234", []string{"10.0.0.5, 192.0.2.20"}, true, false, "10.0.0.5"},
+		{"Missing header", "192.0.2.10:1234", nil, true, false, "192.0.2.10"},
+		{"Malformed relevant hop", "192.0.2.10:1234", []string{"10.0.0.5, invalid, 192.0.2.20"}, true, false, "192.0.2.10"},
+		{"Nil parser", "192.0.2.10:1234", []string{"10.0.0.5"}, true, true, "192.0.2.10"},
+		{"Reverse proxy disabled in scope", "192.0.2.10:1234", []string{"10.0.0.5"}, false, false, "192.0.2.10"},
+		{"IPv6", "[2001:db8:1::10]:1234", []string{"10.0.0.5", " [2001:db8:2::23]:443 , 2001:db8:1::20"}, true, false, "2001:db8:2::23"},
+		{"Unix socket", "@", []string{"10.0.0.5, 198.51.100.23"}, true, false, "198.51.100.23"},
+		{"Entire chain trusted", "192.0.2.10:1234", []string{"192.0.2.30, 192.0.2.20"}, true, false, "192.0.2.30"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			o := testOptions()
+			o.ReverseProxy = true
+			o.RealClientIPHeader = "X-Forwarded-For"
+			o.TrustedProxyIPs = []string{"192.0.2.0/24", "2001:db8:1::/48"}
+			o.Logging.AuthFormat = "{{.Client}}"
+			o.Logging.RequestFormat = "{{.Client}}"
+			require.NoError(t, Validate(o))
+			if test.nilParser {
+				o.SetRealClientIPParser(nil)
+			}
+			trustedProxies, err := ip.ParseNetSet(o.TrustedProxyIPs)
+			require.NoError(t, err)
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			req.RemoteAddr = test.remoteAddr
+			for _, value := range test.headerValues {
+				req.Header.Add("X-Forwarded-For", value)
+			}
+			req = middlewareapi.AddRequestScope(req, &middlewareapi.RequestScope{
+				ReverseProxy:   test.reverseProxy,
+				TrustedProxies: trustedProxies,
+			})
+			var output bytes.Buffer
+			logger.SetOutput(&output)
+			logger.PrintAuthf("", req, logger.AuthFailure, "denied")
+			logger.PrintReq("", "", req, *req.URL, time.Now(), http.StatusForbidden, 0)
+			assert.Equal(t, test.expected+"\n"+test.expected+"\n", output.String())
+		})
+	}
+}
+
 func TestProviderCAFilesError(t *testing.T) {
-	file, err := ioutil.TempFile("", "absent.*.crt")
+	file, err := os.CreateTemp("", "absent.*.crt")
 	assert.NoError(t, err)
 	assert.NoError(t, file.Close())
 	assert.NoError(t, os.Remove(file.Name()))

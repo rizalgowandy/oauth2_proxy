@@ -2,26 +2,48 @@ package options
 
 // Server represents the configuration for an HTTP(S) server
 type Server struct {
-	// BindAddress is the the address on which to serve traffic.
+	// BindAddress is the address on which to serve traffic.
+	// Different types of bind addresses are supported:
+	// * `[http://]<addr>:<port>`
+	// * `fd:<int>` (case insensitive)
+	// * `unix://<path>`
+	// Unix sockets are created with default system umask mode, which can be overridden, e.g.: `unix://my-socket,mode=0777`
+	// Square brackets are required for ipv6 address, e.g. `http://[::1]:4180`
 	// Leave blank or set to "-" to disable.
-	BindAddress string
+	BindAddress string `yaml:"bindAddress,omitempty"`
 
-	// SecureBindAddress is the the address on which to serve secure traffic.
+	// SecureBindAddress is the address on which to serve secure traffic.
+	// Secure bind addresses need to respond with valid SSL and use the following format:
+	// * `[https://]<addr>:<port>`
+	// Square brackets are required for ipv6 address, e.g. `https://[::1]:4180`
 	// Leave blank or set to "-" to disable.
-	SecureBindAddress string
+	SecureBindAddress string `yaml:"secureBindAddress,omitempty"`
 
 	// TLS contains the information for loading the certificate and key for the
-	// secure traffic.
-	TLS *TLS
+	// secure traffic and further configuration for the TLS server.
+	TLS *TLS `yaml:"tls,omitempty"`
 }
 
-// TLS contains the information for loading a TLS certifcate and key.
+// TLS contains the information for loading a TLS certificate and key
+// as well as an optional minimal TLS version that is acceptable.
 type TLS struct {
-	// Key is the the TLS key data to use.
+	// Key is the TLS key data to use.
 	// Typically this will come from a file.
-	Key *SecretSource
+	Key *SecretSource `yaml:"key,omitempty"`
 
 	// Cert is the TLS certificate data to use.
 	// Typically this will come from a file.
-	Cert *SecretSource
+	Cert *SecretSource `yaml:"cert,omitempty"`
+
+	// MinVersion is the minimal TLS version that is acceptable.
+	// E.g. Set to "TLS1.3" to select TLS version 1.3
+	MinVersion string `yaml:"minVersion,omitempty"`
+
+	// CipherSuites is a list of TLS cipher suites that are allowed.
+	// E.g.:
+	// - TLS_RSA_WITH_RC4_128_SHA
+	// - TLS_RSA_WITH_AES_256_GCM_SHA384
+	// If not specified, the default Go safe cipher list is used.
+	// List of valid cipher suites can be found in the [crypto/tls documentation](https://pkg.go.dev/crypto/tls#pkg-constants).
+	CipherSuites []string `yaml:"cipherSuites,omitempty"`
 }

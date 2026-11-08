@@ -8,8 +8,8 @@ import (
 	middlewareapi "github.com/oauth2-proxy/oauth2-proxy/v7/pkg/apis/middleware"
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/apis/options"
 	sessionsapi "github.com/oauth2-proxy/oauth2-proxy/v7/pkg/apis/sessions"
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/ginkgo/extensions/table"
+	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/util/ptr"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
@@ -116,7 +116,7 @@ var _ = Describe("Headers Suite", func() {
 			headers: []options.Header{
 				{
 					Name:                 "Claim",
-					PreserveRequestValue: true,
+					PreserveRequestValue: ptr.To(true),
 					Values: []options.HeaderValue{
 						{
 							ClaimSource: &options.ClaimSource{
@@ -161,7 +161,7 @@ var _ = Describe("Headers Suite", func() {
 			headers: []options.Header{
 				{
 					Name:                 "Claim",
-					PreserveRequestValue: true,
+					PreserveRequestValue: ptr.To(true),
 					Values: []options.HeaderValue{
 						{
 							ClaimSource: &options.ClaimSource{
@@ -205,6 +205,50 @@ var _ = Describe("Headers Suite", func() {
 			},
 			expectedHeaders: nil,
 			expectedErr:     "error building request header injector: error building request injector: error building injector for header \"X-Auth-Request-Authorization\": error loading basicAuthPassword: secret source is invalid: exactly one entry required, specify either value, fromEnv or fromFile",
+		}),
+		Entry("strips normalized variants before injecting", headersTableInput{
+			headers: []options.Header{
+				{
+					Name: "X-Auth-Request-User",
+					Values: []options.HeaderValue{
+						{
+							ClaimSource: &options.ClaimSource{Claim: "user"},
+						},
+					},
+				},
+			},
+			initialHeaders: http.Header{
+				"X-Auth-Request-User": []string{"old"},
+				"X-Auth_Request_User": []string{"evil"},
+			},
+			session: &sessionsapi.SessionState{User: "user-123"},
+			expectedHeaders: http.Header{
+				"X-Auth-Request-User": []string{"user-123"},
+			},
+			expectedErr: "",
+		}),
+		Entry("doesn't strip normalized variants before injecting", headersTableInput{
+			headers: []options.Header{
+				{
+					Name:                            "X-Auth-Request-User",
+					InsecureSkipHeaderNormalization: ptr.To(true),
+					Values: []options.HeaderValue{
+						{
+							ClaimSource: &options.ClaimSource{Claim: "user"},
+						},
+					},
+				},
+			},
+			initialHeaders: http.Header{
+				"X-Auth-Request-User": []string{"old"},
+				"X-Auth_Request_User": []string{"evil"},
+			},
+			session: &sessionsapi.SessionState{User: "user-123"},
+			expectedHeaders: http.Header{
+				"X-Auth-Request-User": []string{"user-123"},
+				"X-Auth_Request_User": []string{"evil"},
+			},
+			expectedErr: "",
 		}),
 	)
 
@@ -253,6 +297,42 @@ var _ = Describe("Headers Suite", func() {
 			},
 			expectedErr: "",
 		}),
+
+		Entry("with flattenHeaders (set-cookie and any other)", headersTableInput{
+			headers: []options.Header{
+				{
+					Name: "Set-Cookie",
+					Values: []options.HeaderValue{
+						{
+							SecretSource: &options.SecretSource{
+								Value: []byte("_oauth2_proxy=ey123123123"),
+							},
+						},
+					},
+				},
+				{
+					Name: "X-Auth-User",
+					Values: []options.HeaderValue{
+						{
+							SecretSource: &options.SecretSource{
+								Value: []byte("oauth_user"),
+							},
+						},
+					},
+				},
+			},
+			initialHeaders: http.Header{
+				"Set-Cookie":  []string{"cookie1=value1", "cookie2=value2"},
+				"X-Auth-User": []string{"oauth_user_1"},
+			},
+
+			expectedHeaders: http.Header{
+				"Set-Cookie":  []string{"cookie1=value1", "cookie2=value2", "_oauth2_proxy=ey123123123"},
+				"X-Auth-User": []string{"oauth_user_1,oauth_user"},
+			},
+			expectedErr: "",
+		}),
+
 		Entry("with a claim valued header", headersTableInput{
 			headers: []options.Header{
 				{
@@ -306,7 +386,7 @@ var _ = Describe("Headers Suite", func() {
 			headers: []options.Header{
 				{
 					Name:                 "Claim",
-					PreserveRequestValue: true,
+					PreserveRequestValue: ptr.To(true),
 					Values: []options.HeaderValue{
 						{
 							ClaimSource: &options.ClaimSource{
@@ -353,7 +433,7 @@ var _ = Describe("Headers Suite", func() {
 			headers: []options.Header{
 				{
 					Name:                 "Claim",
-					PreserveRequestValue: true,
+					PreserveRequestValue: ptr.To(true),
 					Values: []options.HeaderValue{
 						{
 							ClaimSource: &options.ClaimSource{

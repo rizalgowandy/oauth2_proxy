@@ -1,6 +1,7 @@
 package persistence
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"time"
@@ -30,8 +31,7 @@ func NewManager(store Store, cookieOpts *options.Cookie) *Manager {
 // from the persistent data store.
 func (m *Manager) Save(rw http.ResponseWriter, req *http.Request, s *sessions.SessionState) error {
 	if s.CreatedAt == nil || s.CreatedAt.IsZero() {
-		now := time.Now()
-		s.CreatedAt = &now
+		s.CreatedAtNow()
 	}
 
 	tckt, err := decodeTicketFromRequest(req, m.Options)
@@ -60,9 +60,12 @@ func (m *Manager) Load(req *http.Request) (*sessions.SessionState, error) {
 		return nil, err
 	}
 
-	return tckt.loadSession(func(key string) ([]byte, error) {
-		return m.Store.Load(req.Context(), key)
-	})
+	return tckt.loadSession(
+		func(key string) ([]byte, error) {
+			return m.Store.Load(req.Context(), key)
+		},
+		m.Store.Lock,
+	)
 }
 
 // Clear clears any saved session information for a given ticket cookie.
@@ -87,4 +90,9 @@ func (m *Manager) Clear(rw http.ResponseWriter, req *http.Request) error {
 	return tckt.clearSession(func(key string) error {
 		return m.Store.Clear(req.Context(), key)
 	})
+}
+
+// VerifyConnection validates the underlying store is ready and connected
+func (m *Manager) VerifyConnection(ctx context.Context) error {
+	return m.Store.VerifyConnection(ctx)
 }

@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/apis/options"
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/apis/sessions"
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/logger"
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/requests"
@@ -13,7 +14,7 @@ import (
 // BitbucketProvider represents an Bitbucket based Identity Provider
 type BitbucketProvider struct {
 	*ProviderData
-	Team       string
+	Workspace  string
 	Repository string
 }
 
@@ -53,7 +54,7 @@ var (
 )
 
 // NewBitbucketProvider initiates a new BitbucketProvider
-func NewBitbucketProvider(p *ProviderData) *BitbucketProvider {
+func NewBitbucketProvider(p *ProviderData, opts options.BitbucketOptions) *BitbucketProvider {
 	p.setProviderDefaults(providerDefaults{
 		name:        bitbucketProviderName,
 		loginURL:    bitbucketDefaultLoginURL,
@@ -62,23 +63,40 @@ func NewBitbucketProvider(p *ProviderData) *BitbucketProvider {
 		validateURL: bitbucketDefaultValidateURL,
 		scope:       bitbucketDefaultScope,
 	})
-	return &BitbucketProvider{ProviderData: p}
+
+	provider := &BitbucketProvider{ProviderData: p}
+
+	if opts.Team != "" {
+		provider.setWorkspace(opts.Team)
+	}
+	if opts.Workspace != "" {
+		provider.setWorkspace(opts.Workspace)
+	}
+	if opts.Repository != "" {
+		provider.setRepository(opts.Repository)
+	}
+	return provider
 }
 
-// SetTeam defines the Bitbucket team the user must be part of
-func (p *BitbucketProvider) SetTeam(team string) {
-	p.Team = team
-	if !strings.Contains(p.Scope, "team") {
-		p.Scope += " team"
+// setWorkspace defines the Bitbucket workspace the user must be part of
+func (p *BitbucketProvider) setWorkspace(workspace string) {
+	p.Workspace = workspace
+	if !strings.Contains(p.Scope, "account") {
+		p.Scope += " account"
 	}
 }
 
-// SetRepository defines the repository the user must have access to
-func (p *BitbucketProvider) SetRepository(repository string) {
+// setRepository defines the repository the user must have access to
+func (p *BitbucketProvider) setRepository(repository string) {
 	p.Repository = repository
 	if !strings.Contains(p.Scope, "repository") {
 		p.Scope += " repository"
 	}
+}
+
+// ValidateSession validates the AccessToken using a Bearer token header
+func (p *BitbucketProvider) ValidateSession(ctx context.Context, s *sessions.SessionState) bool {
+	return validateToken(ctx, p, s.AccessToken, makeOIDCHeader(s.AccessToken))
 }
 
 // GetEmailAddress returns the email of the authenticated user
@@ -90,9 +108,11 @@ func (p *BitbucketProvider) GetEmailAddress(ctx context.Context, s *sessions.Ses
 			Primary bool   `json:"is_primary"`
 		}
 	}
-	var teams struct {
+	var workspaces struct {
 		Values []struct {
-			Name string `json:"username"`
+			Workspace struct {
+				Slug string `json:"slug"`
+			} `json:"workspace"`
 		}
 	}
 	var repositories struct {
@@ -101,9 +121,10 @@ func (p *BitbucketProvider) GetEmailAddress(ctx context.Context, s *sessions.Ses
 		}
 	}
 
-	requestURL := p.ValidateURL.String() + "?access_token=" + s.AccessToken
+	requestURL := p.ValidateURL.String()
 	err := requests.New(requestURL).
 		WithContext(ctx).
+		WithHeaders(makeOIDCHeader(s.AccessToken)).
 		Do().
 		UnmarshalInto(&emails)
 	if err != nil {
@@ -111,24 +132,29 @@ func (p *BitbucketProvider) GetEmailAddress(ctx context.Context, s *sessions.Ses
 		return "", err
 	}
 
-	if p.Team != "" {
+	if p.Workspace != "" {
 		teamURL := &url.URL{}
 		*teamURL = *p.ValidateURL
-		teamURL.Path = "/2.0/teams"
+		// /teams api was deprecated in Oct 20, use workspaces instead
+		// https://developer.atlassian.com/cloud/bitbucket/bitbucket-api-teams-deprecation/
+		// https://developer.atlassian.com/cloud/bitbucket/rest/api-group-workspaces/#api-workspaces-get
+		teamURL.Path = "2.0/user/workspaces"
 
-		requestURL := teamURL.String() + "?role=member&access_token=" + s.AccessToken
+		requestURL := teamURL.String()
 
 		err := requests.New(requestURL).
 			WithContext(ctx).
+			WithHeaders(makeOIDCHeader(s.AccessToken)).
 			Do().
-			UnmarshalInto(&teams)
+			UnmarshalInto(&workspaces)
+		logger.Printf("workspaces: %+v", workspaces)
 		if err != nil {
 			logger.Errorf("failed requesting teams membership: %v", err)
 			return "", err
 		}
 		var found = false
-		for _, team := range teams.Values {
-			if p.Team == team.Name {
+		for _, workspace := range workspaces.Values {
+			if p.Workspace == workspace.Workspace.Slug {
 				found = true
 				break
 			}
@@ -142,14 +168,16 @@ func (p *BitbucketProvider) GetEmailAddress(ctx context.Context, s *sessions.Ses
 	if p.Repository != "" {
 		repositoriesURL := &url.URL{}
 		*repositoriesURL = *p.ValidateURL
-		repositoriesURL.Path = "/2.0/repositories/" + strings.Split(p.Repository, "/")[0]
+		// split the repository name to get the workspace name, which is the first part of the repository name
+		var repoWorkspace = strings.Split(p.Repository, "/")[0]
+		repositoriesURL.Path = "/2.0/repositories/" + repoWorkspace
 
 		requestURL := repositoriesURL.String() + "?role=contributor" +
-			"&q=full_name=" + url.QueryEscape("\""+p.Repository+"\"") +
-			"&access_token=" + s.AccessToken
+			"&q=full_name=" + url.QueryEscape("\""+p.Repository+"\"")
 
 		err := requests.New(requestURL).
 			WithContext(ctx).
+			WithHeaders(makeOIDCHeader(s.AccessToken)).
 			Do().
 			UnmarshalInto(&repositories)
 		if err != nil {

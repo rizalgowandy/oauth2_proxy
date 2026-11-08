@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -12,7 +13,7 @@ import (
 	sessionsapi "github.com/oauth2-proxy/oauth2-proxy/v7/pkg/apis/sessions"
 	cookiesapi "github.com/oauth2-proxy/oauth2-proxy/v7/pkg/cookies"
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/encryption"
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
@@ -126,6 +127,42 @@ func RunSessionStoreTests(newSS NewSessionStoreFunc, persistentFastForward Persi
 				var err error
 				ss, err = newSS(opts, input.cookieOpts)
 				Expect(err).ToNot(HaveOccurred())
+			})
+
+			SessionStoreInterfaceTests(&input)
+			if persistentFastForward != nil {
+				PersistentSessionStoreInterfaceTests(&input)
+			}
+		})
+
+		Context("with cookie secret file", func() {
+			var tmpfile *os.File
+			var err error
+			BeforeEach(func() {
+				tmpfile, err = os.CreateTemp("", "cookie-secret-test")
+				secretBytes := make([]byte, 32)
+				tmpfile.Write(secretBytes)
+				tmpfile.Close()
+
+				input.cookieOpts = &options.Cookie{
+					Name:       "_oauth2_proxy_file",
+					Path:       "/",
+					Expire:     time.Duration(168) * time.Hour,
+					Refresh:    time.Duration(1) * time.Hour,
+					Secure:     true,
+					HTTPOnly:   true,
+					SameSite:   "",
+					Secret:     "",
+					SecretFile: tmpfile.Name(),
+				}
+				ss, err = newSS(opts, input.cookieOpts)
+				Expect(err).ToNot(HaveOccurred())
+			})
+
+			AfterEach(func() {
+				if tmpfile != nil {
+					os.Remove(tmpfile.Name())
+				}
 			})
 
 			SessionStoreInterfaceTests(&input)
@@ -286,6 +323,78 @@ func PersistentSessionStoreInterfaceTests(in *testInput) {
 			})
 		})
 	})
+
+	Context("when lock is applied", func() {
+		var loadedSession *sessionsapi.SessionState
+		BeforeEach(func() {
+			resp := httptest.NewRecorder()
+			err := in.ss().Save(resp, in.request, in.session)
+			Expect(err).ToNot(HaveOccurred())
+
+			for _, cookie := range resp.Result().Cookies() {
+				in.request.AddCookie(cookie)
+			}
+
+			loadedSession, err = in.ss().Load(in.request)
+			Expect(err).ToNot(HaveOccurred())
+			err = loadedSession.ObtainLock(in.request.Context(), 2*time.Minute)
+			Expect(err).ToNot(HaveOccurred())
+			isLocked, err := loadedSession.PeekLock(in.request.Context())
+			Expect(err).ToNot(HaveOccurred())
+			Expect(isLocked).To(BeTrue())
+		})
+
+		Context("before lock expired", func() {
+			BeforeEach(func() {
+				Expect(in.persistentFastForward(time.Minute)).To(Succeed())
+			})
+
+			It("peek returns true on loaded session lock", func() {
+				l := *loadedSession
+				isLocked, err := l.PeekLock(in.request.Context())
+
+				Expect(err).NotTo(HaveOccurred())
+				Expect(isLocked).To(BeTrue())
+			})
+
+			It("lock can be released", func() {
+				l := *loadedSession
+
+				err := l.ReleaseLock(in.request.Context())
+				Expect(err).NotTo(HaveOccurred())
+
+				isLocked, err := l.PeekLock(in.request.Context())
+				Expect(err).NotTo(HaveOccurred())
+				Expect(isLocked).To(BeFalse())
+			})
+
+			It("lock is refreshed", func() {
+				l := *loadedSession
+				err := l.RefreshLock(in.request.Context(), 3*time.Minute)
+				Expect(err).NotTo(HaveOccurred())
+
+				Expect(in.persistentFastForward(2 * time.Minute)).To(Succeed())
+
+				isLocked, err := l.PeekLock(in.request.Context())
+				Expect(err).NotTo(HaveOccurred())
+				Expect(isLocked).To(BeTrue())
+			})
+		})
+
+		Context("after lock expired", func() {
+			BeforeEach(func() {
+				Expect(in.persistentFastForward(3 * time.Minute)).To(Succeed())
+			})
+
+			It("peek returns false on loaded session lock", func() {
+				l := *loadedSession
+				isLocked, err := l.PeekLock(in.request.Context())
+
+				Expect(err).NotTo(HaveOccurred())
+				Expect(isLocked).To(BeFalse())
+			})
+		})
+	})
 }
 
 func SessionStoreInterfaceTests(in *testInput) {
@@ -313,7 +422,17 @@ func SessionStoreInterfaceTests(in *testInput) {
 				broken := "BrokenSessionFromADifferentSessionImplementation"
 				value, err := encryption.SignedValue(in.cookieOpts.Secret, in.cookieOpts.Name, []byte(broken), time.Now())
 				Expect(err).ToNot(HaveOccurred())
-				cookie := cookiesapi.MakeCookieFromOptions(in.request, in.cookieOpts.Name, value, in.cookieOpts, in.cookieOpts.Expire, time.Now())
+				cookieOptions := &cookiesapi.CookieOptions{
+					Name:       in.cookieOpts.Name,
+					Value:      value,
+					Domains:    in.cookieOpts.Domains,
+					Expiration: in.cookieOpts.Expire,
+					SameSite:   in.cookieOpts.SameSite,
+					Path:       in.cookieOpts.Path,
+					HTTPOnly:   in.cookieOpts.HTTPOnly,
+					Secure:     in.cookieOpts.Secure,
+				}
+				cookie := cookiesapi.MakeCookieFromOptions(in.request, cookieOptions)
 				in.request.AddCookie(cookie)
 
 				err = in.ss().Save(in.response, in.request, in.session)
@@ -380,21 +499,44 @@ func SessionStoreInterfaceTests(in *testInput) {
 	})
 
 	Context("when Load is called", func() {
-		BeforeEach(func() {
-			req := httptest.NewRequest("GET", "http://example.com/", nil)
-			resp := httptest.NewRecorder()
-			err := in.ss().Save(resp, req, in.session)
-			Expect(err).ToNot(HaveOccurred())
+		Context("with a valid session cookie in the request", func() {
+			BeforeEach(func() {
+				req := httptest.NewRequest("GET", "http://example.com/", nil)
+				resp := httptest.NewRecorder()
+				err := in.ss().Save(resp, req, in.session)
+				Expect(err).ToNot(HaveOccurred())
+				for _, cookie := range resp.Result().Cookies() {
+					in.request.AddCookie(cookie)
+				}
+			})
 
-			for _, cookie := range resp.Result().Cookies() {
-				in.request.AddCookie(cookie)
-			}
+			Context("before the refresh period", func() {
+				LoadSessionTests(in)
+			})
 		})
 
-		Context("before the refresh period", func() {
-			LoadSessionTests(in)
-		})
+		Context("with no cookies in the request", func() {
+			var loadedSession *sessionsapi.SessionState
+			var loadErr error
 
+			BeforeEach(func() {
+				loadedSession, loadErr = in.ss().Load(in.request)
+			})
+
+			It("returns an empty session", func() {
+				Expect(loadedSession).To(BeNil())
+			})
+
+			It("should return a no cookie error", func() {
+				Expect(loadErr).To(MatchError(http.ErrNoCookie))
+			})
+		})
+	})
+
+	Context("when VerifyConnection is called", func() {
+		It("should return without an error", func() {
+			Expect(in.ss().VerifyConnection(in.request.Context())).ToNot(HaveOccurred())
+		})
 	})
 }
 
@@ -411,9 +553,11 @@ func LoadSessionTests(in *testInput) {
 		l := *loadedSession
 		l.CreatedAt = nil
 		l.ExpiresOn = nil
+		l.Lock = &sessionsapi.NoOpLock{}
 		s := *in.session
 		s.CreatedAt = nil
 		s.ExpiresOn = nil
+		s.Lock = &sessionsapi.NoOpLock{}
 		Expect(l).To(Equal(s))
 
 		// Compare time.Time separately

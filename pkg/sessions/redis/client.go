@@ -4,14 +4,17 @@ import (
 	"context"
 	"time"
 
-	"github.com/go-redis/redis/v8"
+	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/apis/sessions"
+	"github.com/redis/go-redis/v9"
 )
 
 // Client is wrapper interface for redis.Client and redis.ClusterClient.
 type Client interface {
 	Get(ctx context.Context, key string) ([]byte, error)
+	Lock(key string) sessions.Lock
 	Set(ctx context.Context, key string, value []byte, expiration time.Duration) error
 	Del(ctx context.Context, key string) error
+	Ping(ctx context.Context) error
 }
 
 var _ Client = (*client)(nil)
@@ -21,7 +24,9 @@ type client struct {
 }
 
 func newClient(c *redis.Client) Client {
-	return &client{Client: c}
+	return &client{
+		Client: c,
+	}
 }
 
 func (c *client) Get(ctx context.Context, key string) ([]byte, error) {
@@ -36,6 +41,14 @@ func (c *client) Del(ctx context.Context, key string) error {
 	return c.Client.Del(ctx, key).Err()
 }
 
+func (c *client) Lock(key string) sessions.Lock {
+	return NewLock(c.Client, key)
+}
+
+func (c *client) Ping(ctx context.Context) error {
+	return c.Client.Ping(ctx).Err()
+}
+
 var _ Client = (*clusterClient)(nil)
 
 type clusterClient struct {
@@ -43,7 +56,9 @@ type clusterClient struct {
 }
 
 func newClusterClient(c *redis.ClusterClient) Client {
-	return &clusterClient{ClusterClient: c}
+	return &clusterClient{
+		ClusterClient: c,
+	}
 }
 
 func (c *clusterClient) Get(ctx context.Context, key string) ([]byte, error) {
@@ -56,4 +71,12 @@ func (c *clusterClient) Set(ctx context.Context, key string, value []byte, expir
 
 func (c *clusterClient) Del(ctx context.Context, key string) error {
 	return c.ClusterClient.Del(ctx, key).Err()
+}
+
+func (c *clusterClient) Lock(key string) sessions.Lock {
+	return NewLock(c.ClusterClient, key)
+}
+
+func (c *clusterClient) Ping(ctx context.Context) error {
+	return c.ClusterClient.Ping(ctx).Err()
 }

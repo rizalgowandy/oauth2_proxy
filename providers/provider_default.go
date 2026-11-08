@@ -5,8 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
-	"time"
 
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/apis/middleware"
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/apis/sessions"
@@ -22,6 +22,10 @@ var (
 	// code
 	ErrMissingCode = errors.New("missing code")
 
+	// ErrEmailNotVerified is returned when the provider reports the user's
+	// email address as not verified
+	ErrEmailNotVerified = errors.New("email not verified")
+
 	// ErrMissingIDToken is returned when an oidc.Token does not contain the
 	// extra `id_token` field for an IDToken.
 	ErrMissingIDToken = errors.New("missing id_token")
@@ -34,14 +38,21 @@ var (
 )
 
 // GetLoginURL with typical oauth parameters
-func (p *ProviderData) GetLoginURL(redirectURI, state, _ string) string {
-	extraParams := url.Values{}
+// codeChallenge and codeChallengeMethod are the PKCE challenge and method to append to the URL params.
+// they will be empty strings if no code challenge should be presented
+func (p *ProviderData) GetLoginURL(redirectURI, state, _ string, extraParams url.Values) string {
+	// Response mode should only be set if a non default mode is requested
+	if p.AuthRequestResponseMode != "" {
+		extraParams.Add("response_mode", p.AuthRequestResponseMode)
+	}
+
 	loginURL := makeLoginURL(p, redirectURI, state, extraParams)
 	return loginURL.String()
 }
 
 // Redeem provides a default implementation of the OAuth2 token redemption process
-func (p *ProviderData) Redeem(ctx context.Context, redirectURL, code string) (*sessions.SessionState, error) {
+// The codeVerifier is set if a code_verifier parameter should be sent for PKCE
+func (p *ProviderData) Redeem(ctx context.Context, redirectURL, code, codeVerifier string) (*sessions.SessionState, error) {
 	if code == "" {
 		return nil, ErrMissingCode
 	}
@@ -56,13 +67,16 @@ func (p *ProviderData) Redeem(ctx context.Context, redirectURL, code string) (*s
 	params.Add("client_secret", clientSecret)
 	params.Add("code", code)
 	params.Add("grant_type", "authorization_code")
+	if codeVerifier != "" {
+		params.Add("code_verifier", codeVerifier)
+	}
 	if p.ProtectedResource != nil && p.ProtectedResource.String() != "" {
 		params.Add("resource", p.ProtectedResource.String())
 	}
 
 	result := requests.New(p.RedeemURL.String()).
 		WithContext(ctx).
-		WithMethod("POST").
+		WithMethod(http.MethodPost).
 		WithBody(bytes.NewBufferString(params.Encode())).
 		SetHeader("Content-Type", "application/x-www-form-urlencoded").
 		Do()
@@ -85,15 +99,20 @@ func (p *ProviderData) Redeem(ctx context.Context, redirectURL, code string) (*s
 	if err != nil {
 		return nil, err
 	}
+	// TODO (@NickMeves): Uses OAuth `expires_in` to set an expiration
 	if token := values.Get("access_token"); token != "" {
-		created := time.Now()
-		return &sessions.SessionState{AccessToken: token, CreatedAt: &created}, nil
+		ss := &sessions.SessionState{
+			AccessToken: token,
+		}
+		ss.CreatedAtNow()
+		return ss, nil
 	}
 
 	return nil, fmt.Errorf("no access token found %s", result.Body())
 }
 
 // GetEmailAddress returns the Account email address
+//
 // Deprecated: Migrate to EnrichSession
 func (p *ProviderData) GetEmailAddress(_ context.Context, _ *sessions.SessionState) (string, error) {
 	return "", ErrNotImplemented
@@ -126,16 +145,23 @@ func (p *ProviderData) ValidateSession(ctx context.Context, s *sessions.SessionS
 	return validateToken(ctx, p, s.AccessToken, nil)
 }
 
-// RefreshSessionIfNeeded should refresh the user's session if required and
-// do nothing if a refresh is not required
-func (p *ProviderData) RefreshSessionIfNeeded(_ context.Context, _ *sessions.SessionState) (bool, error) {
-	return false, nil
+// RefreshSession refreshes the user's session
+func (p *ProviderData) RefreshSession(_ context.Context, _ *sessions.SessionState) (bool, error) {
+	return false, ErrNotImplemented
 }
 
 // CreateSessionFromToken converts Bearer IDTokens into sessions
 func (p *ProviderData) CreateSessionFromToken(ctx context.Context, token string) (*sessions.SessionState, error) {
 	if p.Verifier != nil {
-		return middleware.CreateTokenToSessionFunc(p.Verifier.Verify)(ctx, token)
+		return middleware.CreateTokenToSessionFunc(p.Verifier.Verify, p.SessionClaimMapping())(ctx, token)
 	}
 	return nil, ErrNotImplemented
+}
+
+// SessionClaimMapping returns the generic bearer session mapping, inheriting only
+// the provider's groups claim and leaving other fields at their bearer defaults.
+func (p *ProviderData) SessionClaimMapping() middleware.SessionClaimMapping {
+	return middleware.SessionClaimMapping{
+		Groups: p.GroupsClaim,
+	}
 }

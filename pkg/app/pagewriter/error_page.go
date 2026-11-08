@@ -9,7 +9,7 @@ import (
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/logger"
 )
 
-// errorMessages are default error messages for each of the the different
+// errorMessages are default error messages for each of the different
 // http status codes expected to be rendered in the error page.
 var errorMessages = map[int]string{
 	http.StatusInternalServerError: "Oops! Something went wrong. For more information contact your server administrator.",
@@ -58,8 +58,6 @@ type ErrorPageOpts struct {
 func (e *errorPageWriter) WriteErrorPage(rw http.ResponseWriter, opts ErrorPageOpts) {
 	rw.WriteHeader(opts.Status)
 
-	// We allow unescaped template.HTML since it is user configured options
-	/* #nosec G203 */
 	data := struct {
 		Title       string
 		Message     string
@@ -76,7 +74,7 @@ func (e *errorPageWriter) WriteErrorPage(rw http.ResponseWriter, opts ErrorPageO
 		StatusCode:  opts.Status,
 		Redirect:    opts.RedirectURL,
 		RequestID:   opts.RequestID,
-		Footer:      template.HTML(e.footer),
+		Footer:      template.HTML(e.footer), // #nosec G203 -- We allow unescaped template.HTML since it is user configured options
 		Version:     e.version,
 	}
 

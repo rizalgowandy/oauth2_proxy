@@ -2,17 +2,15 @@ package sessions
 
 import (
 	"bytes"
-	"errors"
+	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
-	"reflect"
 	"time"
-	"unicode/utf8"
 
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/encryption"
-	"github.com/pierrec/lz4"
-	"github.com/vmihailenco/msgpack/v4"
+	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/util"
+	"github.com/pierrec/lz4/v4"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 // SessionState is used to store information about the currently authenticated user session
@@ -30,11 +28,75 @@ type SessionState struct {
 	User              string   `msgpack:"u,omitempty"`
 	Groups            []string `msgpack:"g,omitempty"`
 	PreferredUsername string   `msgpack:"pu,omitempty"`
+
+	// Additional claims
+	AdditionalClaims map[string]interface{} `msgpack:"ac,omitempty"`
+
+	// Internal helpers, not serialized
+	Clock     func() time.Time `msgpack:"-"` // override for time.Now, for testing
+	Lock      Lock             `msgpack:"-"`
+	Refreshed bool             `msgpack:"-"` // indicates whether the session was refreshed
+}
+
+func (s *SessionState) now() time.Time {
+	if s.Clock != nil {
+		return s.Clock()
+	}
+	return time.Now()
+}
+
+func (s *SessionState) ObtainLock(ctx context.Context, expiration time.Duration) error {
+	if s.Lock == nil {
+		s.Lock = &NoOpLock{}
+	}
+	return s.Lock.Obtain(ctx, expiration)
+}
+
+func (s *SessionState) RefreshLock(ctx context.Context, expiration time.Duration) error {
+	if s.Lock == nil {
+		s.Lock = &NoOpLock{}
+	}
+	return s.Lock.Refresh(ctx, expiration)
+}
+
+func (s *SessionState) ReleaseLock(ctx context.Context) error {
+	if s.Lock == nil {
+		s.Lock = &NoOpLock{}
+	}
+	return s.Lock.Release(ctx)
+}
+
+func (s *SessionState) PeekLock(ctx context.Context) (bool, error) {
+	if s.Lock == nil {
+		s.Lock = &NoOpLock{}
+	}
+	return s.Lock.Peek(ctx)
+}
+
+// CreatedAtNow sets a SessionState's CreatedAt to now
+func (s *SessionState) CreatedAtNow() {
+	now := s.now()
+	s.CreatedAt = &now
+}
+
+// SetExpiresOn sets an expiration
+func (s *SessionState) SetExpiresOn(exp time.Time) {
+	s.ExpiresOn = &exp
+}
+
+// ExpiresIn sets an expiration a certain duration from CreatedAt.
+// CreatedAt will be set to time.Now if it is unset.
+func (s *SessionState) ExpiresIn(d time.Duration) {
+	if s.CreatedAt == nil {
+		s.CreatedAtNow()
+	}
+	exp := s.CreatedAt.Add(d)
+	s.ExpiresOn = &exp
 }
 
 // IsExpired checks whether the session has expired
 func (s *SessionState) IsExpired() bool {
-	if s.ExpiresOn != nil && !s.ExpiresOn.IsZero() && s.ExpiresOn.Before(time.Now()) {
+	if s.ExpiresOn != nil && !s.ExpiresOn.IsZero() && s.ExpiresOn.Before(s.now()) {
 		return true
 	}
 	return false
@@ -43,7 +105,7 @@ func (s *SessionState) IsExpired() bool {
 // Age returns the age of a session
 func (s *SessionState) Age() time.Duration {
 	if s.CreatedAt != nil && !s.CreatedAt.IsZero() {
-		return time.Now().Truncate(time.Second).Sub(*s.CreatedAt)
+		return s.now().Truncate(time.Second).Sub(*s.CreatedAt)
 	}
 	return 0
 }
@@ -65,6 +127,8 @@ func (s *SessionState) String() string {
 	}
 	if s.RefreshToken != "" {
 		o += " refresh_token:true"
+	} else {
+		o += " refresh_token:false"
 	}
 	if len(s.Groups) > 0 {
 		o += fmt.Sprintf(" groups:%v", s.Groups)
@@ -98,8 +162,18 @@ func (s *SessionState) GetClaim(claim string) []string {
 	case "preferred_username":
 		return []string{s.PreferredUsername}
 	default:
-		return []string{}
+		return s.getAdditionalClaim(claim)
 	}
+}
+
+func (s *SessionState) getAdditionalClaim(claim string) []string {
+	if value, ok := s.AdditionalClaims[claim]; ok {
+		var result []string
+		if err := util.CoerceClaim(value, &result); err == nil {
+			return result
+		}
+	}
+	return []string{}
 }
 
 // CheckNonce compares the Nonce against a potential hash of it
@@ -146,11 +220,6 @@ func DecodeSessionState(data []byte, c encryption.Cipher, compressed bool) (*Ses
 		return nil, fmt.Errorf("error unmarshalling data to session state: %w", err)
 	}
 
-	err = ss.validate()
-	if err != nil {
-		return nil, err
-	}
-
 	return &ss, nil
 }
 
@@ -162,10 +231,10 @@ func DecodeSessionState(data []byte, c encryption.Cipher, compressed bool) (*Ses
 func lz4Compress(payload []byte) ([]byte, error) {
 	buf := new(bytes.Buffer)
 	zw := lz4.NewWriter(nil)
-	zw.Header = lz4.Header{
-		BlockMaxSize:     65536,
-		CompressionLevel: 0,
-	}
+	zw.Apply(
+		lz4.BlockSizeOption(lz4.BlockSize(65536)),
+		lz4.CompressionLevelOption(lz4.Fast),
+	)
 	zw.Reset(buf)
 
 	reader := bytes.NewReader(payload)
@@ -178,7 +247,7 @@ func lz4Compress(payload []byte) ([]byte, error) {
 		return nil, fmt.Errorf("error closing lz4 writer: %w", err)
 	}
 
-	compressed, err := ioutil.ReadAll(buf)
+	compressed, err := io.ReadAll(buf)
 	if err != nil {
 		return nil, fmt.Errorf("error reading lz4 buffer: %w", err)
 	}
@@ -197,42 +266,10 @@ func lz4Decompress(compressed []byte) ([]byte, error) {
 		return nil, fmt.Errorf("error copying lz4 stream to buffer: %w", err)
 	}
 
-	payload, err := ioutil.ReadAll(buf)
+	payload, err := io.ReadAll(buf)
 	if err != nil {
 		return nil, fmt.Errorf("error reading lz4 buffer: %w", err)
 	}
 
 	return payload, nil
-}
-
-// validate ensures the decoded session is non-empty and contains valid data
-//
-// Non-empty check is needed due to ensure the non-authenticated AES-CFB
-// decryption doesn't result in garbage data that collides with a valid
-// MessagePack header bytes (which MessagePack will unmarshal to an empty
-// default SessionState). <1% chance, but observed with random test data.
-//
-// UTF-8 check ensures the strings are valid and not raw bytes overloaded
-// into Latin-1 encoding. The occurs when legacy unencrypted fields are
-// decrypted with AES-CFB which results in random bytes.
-func (s *SessionState) validate() error {
-	for _, field := range []string{
-		s.User,
-		s.Email,
-		s.PreferredUsername,
-		s.AccessToken,
-		s.IDToken,
-		s.RefreshToken,
-	} {
-		if !utf8.ValidString(field) {
-			return errors.New("invalid non-UTF8 field in session")
-		}
-	}
-
-	empty := new(SessionState)
-	if reflect.DeepEqual(*s, *empty) {
-		return errors.New("invalid empty session unmarshalled")
-	}
-
-	return nil
 }
